@@ -5,13 +5,13 @@ project(metall_preload LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
-find_package(Boost 1.80)
+find_package(Boost 1.80 COMPONENTS filesystem)
 if (NOT Boost_FOUND)
     message(STATUS "Download or search previously downloaded Boost using FetchContent")
     FetchContent_Declare(Boost
             URL https://boostorg.jfrog.io/artifactory/main/release/1.80.0/source/boost_1_80_0.tar.bz2)
     FetchContent_MakeAvailable(Boost)
-    find_package(Boost 1.80 REQUIRED)
+    find_package(Boost 1.80 REQUIRED REQUIRED COMPONENTS filesystem)
 endif ()
 
 # Download and setup Metall.
@@ -37,3 +37,5 @@ target_link_libraries(metall_preload PRIVATE stdc++fs)
 target_link_libraries(metall_preload PRIVATE Threads::Threads)
 target_link_libraries(metall_preload PRIVATE Metall::Metall)
 
+# Our boost usage
+target_link_libraries(metall_preload PRIVATE Boost::filesystem)
