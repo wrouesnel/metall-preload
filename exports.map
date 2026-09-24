@@ -1,0 +1,35 @@
+{
+  global:
+    malloc; free; calloc; realloc; reallocarray;
+    posix_memalign; aligned_alloc; memalign; valloc; pvalloc;
+    malloc_usable_size;
+    clone;
+    GC_init; GC_malloc; GC_malloc_atomic; GC_malloc_uncollectable;
+    GC_malloc_atomic_uncollectable; GC_malloc_many; GC_free;
+    GC_gcollect; GC_expand_hp;
+    GC_register_finalizer; GC_register_finalizer_ignore_self;
+    GC_register_finalizer_no_order; GC_register_finalizer_unreachable;
+    extern "C++" {
+      "operator new(unsigned long)";
+      "operator new[](unsigned long)";
+      "operator new(unsigned long, std::nothrow_t const&)";
+      "operator new[](unsigned long, std::nothrow_t const&)";
+      "operator new(unsigned long, std::align_val_t)";
+      "operator new[](unsigned long, std::align_val_t)";
+      "operator new(unsigned long, std::align_val_t, std::nothrow_t const&)";
+      "operator new[](unsigned long, std::align_val_t, std::nothrow_t const&)";
+      "operator delete(void*)";
+      "operator delete[](void*)";
+      "operator delete(void*, unsigned long)";
+      "operator delete[](void*, unsigned long)";
+      "operator delete(void*, std::align_val_t)";
+      "operator delete[](void*, std::align_val_t)";
+      "operator delete(void*, unsigned long, std::align_val_t)";
+      "operator delete[](void*, unsigned long, std::align_val_t)";
+      "operator delete(void*, std::nothrow_t const&)";
+      "operator delete[](void*, std::nothrow_t const&)";
+      "operator delete(void*, std::align_val_t, std::nothrow_t const&)";
+      "operator delete[](void*, std::align_val_t, std::nothrow_t const&)";
+    };
+  local: *;
+};

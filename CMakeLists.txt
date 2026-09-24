@@ -1,41 +1,42 @@
-cmake_minimum_required(VERSION 4.2)
+cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
-project(metall_preload LANGUAGES C CXX)
+project(metall_preload LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
-
-find_package(Boost 1.80 COMPONENTS filesystem)
-if (NOT Boost_FOUND)
-    message(STATUS "Download or search previously downloaded Boost using FetchContent")
-    FetchContent_Declare(Boost
-            URL https://boostorg.jfrog.io/artifactory/main/release/1.80.0/source/boost_1_80_0.tar.bz2)
-    FetchContent_MakeAvailable(Boost)
-    find_package(Boost 1.80 REQUIRED REQUIRED COMPONENTS filesystem)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
 endif ()
 
-# Download and setup Metall.
-if (NOT BUILD_C)
-    # Just install Metall header files and avoid building executables in the repository.
-    set(JUST_INSTALL_METALL_HEADER TRUE)
-endif ()
+# Metall is header-only but needs Boost headers (no compiled Boost libraries).
+find_package(Boost 1.80 REQUIRED)
+
+# Just install Metall header files and avoid building executables in the repository.
+set(JUST_INSTALL_METALL_HEADER TRUE)
 FetchContent_Declare(
         Metall
         GIT_REPOSITORY https://github.com/LLNL/metall.git
-        GIT_TAG master
+        GIT_TAG 3aa4b9a5
 )
 FetchContent_MakeAvailable(Metall)
 
+find_package(Threads REQUIRED)
+
 # Main library
 add_library(metall_preload SHARED metall-preload.cpp)
+target_link_libraries(metall_preload PRIVATE Metall::Metall Boost::headers Threads::Threads ${CMAKE_DL_LIBS})
 
-# Metall CXX API
-find_package(Threads)
-target_include_directories(metall_preload PRIVATE ${Boost_INCLUDE_DIRS})
+# The whole segment is created up front as sparse files (see metall-preload.cpp),
+# so use large blocks to keep the number of files and descriptors small.
+target_compile_definitions(metall_preload PRIVATE METALL_SEGMENT_BLOCK_SIZE=\(1ULL<<35ULL\))
 
-target_link_libraries(metall_preload PRIVATE stdc++fs)
-target_link_libraries(metall_preload PRIVATE Threads::Threads)
-target_link_libraries(metall_preload PRIVATE Metall::Metall)
-
-# Our boost usage
-target_link_libraries(metall_preload PRIVATE Boost::filesystem)
+# Only the interposed allocator entry points are exported.
+set_target_properties(metall_preload PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/exports.map)
+target_link_options(metall_preload PRIVATE
+        -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map
+        -Wl,-z,nodelete
+        -Wl,--no-undefined)
