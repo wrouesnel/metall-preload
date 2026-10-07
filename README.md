@@ -70,6 +70,13 @@ builders and so on) passes straight through to the normal allocator.
     each other's writes.
   * `clone()` calls whose stack is inside the heap are given a private stack
     instead.
+  * The copy may not fit on disk (the free space would drop below
+    `METALL_PRELOAD_MIN_FREE`), or it may fail. If the heap's data then fits
+    in available memory, the parent waits while the child copies the heap
+    into private memory. Otherwise the child exits at once and `fork()` or
+    `clone()` fails with `ENOMEM`.
+  * A child never keeps a view of the parent's heap files. The parent goes on
+    writing to them, and the child would see those writes.
 * **Cleanup.**
   * The heap directory is removed when the owning process exits.
   * A process that is SIGKILLed leaves its directory behind. nix does this to
@@ -161,6 +168,12 @@ These were measured with Determinate nix 3.22.5.
 ```sh
 g++ -O1 -g -std=c++20 -pthread test/stress.cpp -o build/stress
 METALL_PRELOAD_ALL_PROCESSES=1 LD_PRELOAD=$PWD/build/libmetall_preload.so build/stress
+
+# fork fallback: the heap on a filesystem too small for a snapshot
+g++ -O1 -g -std=c++20 test/fork_fallback.cpp -o build/fork_fallback
+sudo mount -t tmpfs -o size=300m,mode=1777 tmpfs /mnt/small
+METALL_PRELOAD_ALL_PROCESSES=1 METALL_PRELOAD_DIR=/mnt/small METALL_PRELOAD_MIN_FREE=1M \
+  LD_PRELOAD=$PWD/build/libmetall_preload.so build/fork_fallback
 
 # version matrix; needs sudo for the daemon check (SKIP_DAEMON=1 to skip)
 nix build --no-link --print-out-paths github:NixOS/nixpkgs/nixos-24.11#nixVersions.nix_2_18

@@ -3,7 +3,7 @@
     malloc; free; calloc; realloc; reallocarray;
     posix_memalign; aligned_alloc; memalign; valloc; pvalloc;
     malloc_usable_size;
-    clone;
+    clone; fork;
     GC_init; GC_malloc; GC_malloc_atomic; GC_malloc_uncollectable;
     GC_malloc_atomic_uncollectable; GC_malloc_many; GC_free;
     GC_strdup; GC_strndup;

@@ -17,7 +17,10 @@
 // * The heap is MAP_SHARED, which a forked child would share with its parent.
 //   pthread_atfork handlers (and a clone() interposer, since nix uses raw
 //   clone() for sandboxed builds) give each child its own copy of the heap
-//   in an unlinked file.
+//   in an unlinked file. Without room for that file the child copies the heap
+//   into private memory while the parent waits; without room for that either
+//   the fork fails with ENOMEM. A child must never keep a view of the
+//   parent's files, which the parent goes on writing.
 
 #include <metall/metall.hpp>
 
@@ -44,6 +47,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define EXPORT __attribute__((visibility("default")))
@@ -111,7 +115,12 @@ struct Source {
   std::size_t len;
 };
 
-enum ForkMode { kForkNone, kForkSnapshot, kForkPrivate };
+enum ForkMode {
+  kForkNone,
+  kForkSnapshot,  // the child maps a copy of the heap file
+  kForkCopy,      // the child copies the heap into anonymous memory
+  kForkFail,      // the child exits at once; fork() reports ENOMEM
+};
 
 // Set once initialisation has fully succeeded.
 std::atomic<bool> g_active{false};
@@ -125,10 +134,8 @@ alignas(kernel_t) unsigned char g_kernel_storage[sizeof(kernel_t)];
 kernel_t *g_kernel = nullptr;
 const cdir_t *g_chunk_dir = nullptr;
 
-// New allocations are refused while the disk is nearly full, and in children
-// whose heap could only be remapped privately.
+// New allocations are refused while the disk is nearly full.
 std::atomic<bool> g_disk_low{false};
-bool g_no_new_allocs = false;
 std::atomic<std::size_t> g_since_disk_check{0};
 std::size_t g_min_free = kDefaultMinFree;
 
@@ -151,8 +158,15 @@ struct PendingFork {
   ForkMode mode;
   int fd;
   bool active;
+  // The child reports whether it has its own heap on this pipe; the parent
+  // waits for it, so nothing is written to the heap in the meantime.
+  int status[2];
 };
-PendingFork g_fork = {kForkNone, -1, false};
+constexpr PendingFork kNoFork = {kForkNone, -1, false, {-1, -1}};
+PendingFork g_fork = kNoFork;
+// Set in the parent when the child could not get its own heap and has exited;
+// fork() and clone() then reap it and fail with ENOMEM.
+__thread bool t_fork_failed __attribute__((tls_model("initial-exec"))) = false;
 
 // Non-zero while this thread is inside Metall, initialisation or a fork
 // handler: any allocation it makes goes to the next allocator.
@@ -196,6 +210,7 @@ struct Next {
   void *(*memalign)(std::size_t, std::size_t);
   std::size_t (*malloc_usable_size)(void *);
   int (*clone)(int (*)(void *), void *, int, void *, ...);
+  pid_t (*fork)(void);
 };
 Next g_next = {};
 std::atomic<int> g_resolve_state{0};  // 0: not yet, 1: resolving, 2: done
@@ -243,6 +258,7 @@ void resolve_next() {
   resolve_one(n.memalign, "memalign");
   resolve_one(n.malloc_usable_size, "malloc_usable_size");
   resolve_one(n.clone, "clone");
+  resolve_one(n.fork, "fork");
   g_next = n;
   g_resolve_state.store(2);
 }
@@ -367,8 +383,7 @@ void *m_alloc(std::size_t n, std::size_t align) {
     sz = (sz + align - 1) & ~(align - 1);
   }
   account(sz);
-  if (g_no_new_allocs || g_disk_low.load(std::memory_order_relaxed))
-    return nullptr;
+  if (g_disk_low.load(std::memory_order_relaxed)) return nullptr;
   // Never let Metall run out of mapped segment (see file header). The chunk
   // directory size is read racily, the slack covers concurrent allocations.
   if (g_chunk_dir->size() * kChunkSize + sz + kSegmentSlack > g_mapped)
@@ -616,9 +631,115 @@ bool copy_segment(int dst, std::size_t used) {
   return true;
 }
 
-void fork_prepare() {
+// Bytes of RAM the kernel considers available, or 0 if unknown.
+unsigned long long mem_available() {
+  int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  char buf[4096];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  const char *p = strstr(buf, "MemAvailable:");
+  return p ? strtoull(p + 13, nullptr, 10) << 10 : 0;
+}
+
+constexpr std::size_t kPage = 4096;
+// RAM left over when deciding whether a child may copy the heap.
+constexpr unsigned long long kCopyHeadroom = 256ULL << 20;
+// The copy goes back into the heap this much at a time, releasing the
+// scratch pages behind it.
+constexpr std::size_t kCopyStep = 64ULL << 20;
+
+// Calls fn(segment offset, length) for each page-aligned data extent of the
+// files backing the heap. Returns false if fn does.
+template <typename F>
+bool for_each_extent(F &&fn) {
+  for (std::size_t i = 0; i < g_num_sources; ++i) {
+    const Source &s = g_sources[i];
+    const off_t limit = off_t(s.len);
+    off_t pos = 0;
+    while (pos < limit) {
+      off_t data = lseek(s.fd, pos, SEEK_DATA);
+      if (data < 0) {
+        if (errno == ENXIO) break;  // no more data in this file
+        data = pos;                 // SEEK_DATA unsupported: take everything
+      }
+      if (data >= limit) break;
+      off_t hole = lseek(s.fd, data, SEEK_HOLE);
+      if (hole < 0 || hole > limit) hole = limit;
+      data &= ~off_t(kPage - 1);
+      hole = std::min<off_t>((hole + off_t(kPage) - 1) & ~off_t(kPage - 1), limit);
+      if (!fn(s.off + std::size_t(data), std::size_t(hole - data))) return false;
+      pos = hole;
+    }
+  }
+  return true;
+}
+
+// Child side of kForkCopy, run while the parent waits: replaces the shared
+// heap mapping with private anonymous memory holding the same data. Syscalls
+// and memcpy only. After a failure the heap may be gone, so the caller exits.
+bool copy_heap_private() {
+  struct Extent {
+    std::size_t off, len;
+  };
+  std::size_t count = 0, bytes = 0;
+  for_each_extent([&](std::size_t, std::size_t len) {
+    ++count;
+    bytes += len;
+    return true;
+  });
+  // The parent's other threads may still fill holes, so leave room.
+  const std::size_t cap = count + 64;
+  const std::size_t list_len =
+      (cap * sizeof(Extent) + kPage - 1) & ~(kPage - 1);
+  const std::size_t tmp_len = bytes + kCopyStep;
+  auto *list = static_cast<Extent *>(mmap(nullptr, list_len,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (list == MAP_FAILED) return false;
+  auto *tmp = static_cast<char *>(mmap(nullptr, tmp_len, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                       -1, 0));
+  if (tmp == MAP_FAILED) return false;
+
+  char *seg = reinterpret_cast<char *>(g_seg_begin);
+  std::size_t n = 0, used = 0;
+  if (!for_each_extent([&](std::size_t off, std::size_t len) {
+        if (n == cap || used + len > tmp_len) return false;
+        memcpy(tmp + used, seg + off, len);
+        list[n++] = {off, len};
+        used += len;
+        return true;
+      }))
+    return false;
+
+  if (mmap(seg, g_mapped, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1,
+           0) != seg)
+    return false;
+  std::size_t pos = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t done = 0; done < list[i].len;) {
+      const std::size_t step = std::min(kCopyStep, list[i].len - done);
+      memcpy(seg + list[i].off + done, tmp + pos, step);
+      madvise(tmp + pos, step, MADV_DONTNEED);
+      pos += step;
+      done += step;
+    }
+  }
+  munmap(tmp, tmp_len);
+  munmap(list, list_len);
+  return true;
+}
+
+// shared_files: the child shares our descriptor table (clone with
+// CLONE_FILES), so it cannot be waited for through a pipe.
+void fork_prepare_impl(bool shared_files) {
   ++t_busy;
-  g_fork = {kForkNone, -1, false};
+  g_fork = kNoFork;
+  t_fork_failed = false;
   if (!g_active.load(std::memory_order_acquire)) return;
   gate_lock();
   g_fork.active = true;
@@ -632,13 +753,32 @@ void fork_prepare() {
     if (fstat(g_sources[i].fd, &st) == 0)
       allocated += (unsigned long long)st.st_blocks * 512;
   }
+  if (!shared_files && pipe2(g_fork.status, O_CLOEXEC) != 0)
+    g_fork.status[0] = g_fork.status[1] = -1;
+  const bool can_wait = g_fork.status[0] >= 0;
+  // Without a snapshot file, the child must copy the heap into memory.
+  auto without_snapshot = [&](const char *why) {
+    const unsigned long long avail = mem_available();
+    if (can_wait && allocated + kCopyHeadroom <= avail) {
+      log_msg("%s; the child copies the heap (%llu MiB) into memory", why,
+              allocated >> 20);
+      g_fork.mode = kForkCopy;
+    } else if (!can_wait) {
+      log_msg("%s, and the child shares our descriptor table so it cannot "
+              "copy the heap; failing the fork", why);
+      g_fork.mode = kForkFail;
+    } else {
+      log_msg("%s, and the heap (%llu MiB) does not fit in available memory "
+              "(%llu MiB); failing the fork",
+              why, allocated >> 20, avail >> 20);
+      g_fork.mode = kForkFail;
+    }
+  };
+
   struct statvfs sv;
   if (fstatvfs(g_sources[0].fd, &sv) == 0 &&
       (unsigned long long)sv.f_bavail * sv.f_frsize < allocated + g_min_free) {
-    log_msg("not enough disk space to snapshot the heap for a child "
-            "(%llu MiB needed); the child gets a private mapping",
-            allocated >> 20);
-    g_fork.mode = kForkPrivate;
+    without_snapshot("not enough disk space to snapshot the heap for a child");
     return;
   }
 
@@ -646,10 +786,11 @@ void fork_prepare() {
   clock_gettime(CLOCK_MONOTONIC, &t0);
   int fd = open_snapshot_file();
   if (fd < 0 || ftruncate(fd, off_t(g_mapped)) != 0 || !copy_segment(fd, used)) {
-    log_msg("failed to snapshot the heap for a child (%s); the child gets a "
-            "private mapping", strerror(errno));
+    char why[256];
+    snprintf(why, sizeof(why), "failed to snapshot the heap for a child (%s)",
+             strerror(errno));
     if (fd >= 0) close(fd);
-    g_fork.mode = kForkPrivate;
+    without_snapshot(why);
     return;
   }
   clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -661,62 +802,91 @@ void fork_prepare() {
   g_fork.fd = fd;
 }
 
+void fork_prepare() { fork_prepare_impl(false); }
+
 void fork_parent_impl(bool close_fd) {
   if (g_fork.active) {
     if (g_fork.fd >= 0 && close_fd) close(g_fork.fd);
+    if (g_fork.status[0] >= 0) {
+      // EOF (the child died, or fork() failed) counts as failure.
+      close(g_fork.status[1]);
+      char c = 0;
+      ssize_t r;
+      do {
+        r = read(g_fork.status[0], &c, 1);
+      } while (r < 0 && errno == EINTR);
+      close(g_fork.status[0]);
+      if (r != 1 || c != 'y') t_fork_failed = true;
+    }
+    if (g_fork.mode == kForkFail) t_fork_failed = true;
     gate_unlock();
   }
-  g_fork = {kForkNone, -1, false};
+  g_fork = kNoFork;
   --t_busy;
 }
 
 void fork_parent() { fork_parent_impl(true); }
 
-// Runs in the child with only this thread alive; syscalls only.
+// Runs in the child with only this thread alive; syscalls only. Exits the
+// child if it cannot get a heap of its own.
 void fork_child_impl(bool own_fds) {
-  if (g_fork.active) {
+  if (g_fork.active && g_need_snapshot) {
     char *seg = reinterpret_cast<char *>(g_seg_begin);
+    ForkMode mode = g_fork.mode;
     bool ok = false;
-    if (g_fork.mode == kForkSnapshot) {
+    if (mode == kForkSnapshot) {
       ok = mmap(seg, g_mapped, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
                 g_fork.fd, 0) == seg;
-      if (!ok) log_msg("failed to map the heap snapshot: %s", strerror(errno));
-    }
-    if (!ok && g_need_snapshot) {
-      // Private copy-on-write view of the files. Pages the child has not yet
-      // touched still follow the parent's writes, so stop handing out new
-      // memory from this heap in the child.
-      ok = true;
-      for (std::size_t i = 0; i < g_num_sources; ++i) {
-        const Source &s = g_sources[i];
-        ok &= mmap(seg + s.off, s.len, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_FIXED, s.fd, 0) == seg + s.off;
-      }
       if (!ok) {
-        log_msg("failed to remap the heap privately: %s", strerror(errno));
-        abort();
+        log_msg("failed to map the heap snapshot (%s)", strerror(errno));
+        // The parent is waiting for us, so copying is still safe.
+        if (g_fork.status[0] >= 0) mode = kForkCopy;
       }
-      g_no_new_allocs = true;
-      g_need_snapshot = false;
+    }
+    if (mode == kForkCopy) {
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      ok = copy_heap_private();
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      if (ok)
+        VLOG("copied the heap into private memory in %ld ms",
+             (t1.tv_sec - t0.tv_sec) * 1000 +
+                 (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    }
+    if (g_fork.status[1] >= 0) {
+      ssize_t r = write(g_fork.status[1], ok ? "y" : "n", 1);
+      (void)r;
+      if (own_fds) {
+        close(g_fork.status[0]);
+        close(g_fork.status[1]);
+      }
+    }
+    if (!ok) {
+      log_msg("no private heap for this child; exiting");
+      _exit(127);
     }
 
     if (own_fds) {
       for (std::size_t i = 0; i < g_num_other_fds; ++i) close(g_other_fds[i]);
-      if (g_fork.mode == kForkSnapshot && ok) {
-        for (std::size_t i = 0; i < g_num_sources; ++i)
-          close(g_sources[i].fd);
-      }
+      for (std::size_t i = 0; i < g_num_sources; ++i) close(g_sources[i].fd);
+      if (mode == kForkCopy && g_fork.fd >= 0) close(g_fork.fd);
     }
     g_num_other_fds = 0;
-    if (g_fork.mode == kForkSnapshot && ok) {
+    if (mode == kForkSnapshot) {
       g_sources[0] = {g_fork.fd, 0, g_mapped};
       g_num_sources = 1;
+    } else {
+      // Anonymous memory now; the kernel copies it on further forks.
+      g_num_sources = 0;
+      g_need_snapshot = false;
     }
+  }
+  if (g_fork.active) {
     g_owner_pid = 0;  // the directory belongs to the parent
     g_writer.store(0);
     for (auto &s : g_shards) s.n.store(0);
   }
-  g_fork = {kForkNone, -1, false};
+  g_fork = kNoFork;
   --t_busy;
 }
 
@@ -1064,14 +1234,39 @@ EXPORT int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) noex
   // Without CLONE_VM the child gets a copy of this stack frame, so ctx is
   // valid in the child too.
   CloneCtx ctx = {fn, arg, flags};
-  fork_prepare();
+  fork_prepare_impl(flags & CLONE_FILES);
   int r = g_next.clone(clone_trampoline, stack, flags, &ctx, ptid, tls, ctid);
   int saved = errno;
   // With CLONE_FILES the child shares our descriptor table and may not have
   // mapped the snapshot yet, so its descriptor must stay open.
   fork_parent_impl(!(flags & CLONE_FILES) || r < 0);
   if (own_stack) munmap(own_stack, kOwnStackSize);  // the child has a copy
+  if (r > 0 && t_fork_failed) {
+    int st;
+    while (waitpid(r, &st, __WALL) < 0 && errno == EINTR) {
+    }
+    saved = ENOMEM;
+    r = -1;
+  }
   errno = saved;
+  return r;
+}
+
+// fork() runs the pthread_atfork handlers; this only turns a child that
+// could not get its own heap into an ENOMEM failure.
+EXPORT pid_t fork(void) noexcept {
+  if (!next_ready() || !g_next.fork) {
+    errno = ENOSYS;
+    return -1;
+  }
+  pid_t r = g_next.fork();
+  if (r > 0 && t_fork_failed) {
+    int st;
+    while (waitpid(r, &st, 0) < 0 && errno == EINTR) {
+    }
+    errno = ENOMEM;
+    return -1;
+  }
   return r;
 }
 
