@@ -62,12 +62,23 @@ Only the nix client processes in this shell are affected. Anything they hand
 to the system daemon (builds, store writes) still runs in the daemon, without
 Metall, unless the daemon is set up as below.
 
-### System-wide, for nix only
+### Daemon-wide
 
-There are two parts. The daemon is configured through systemd. Clients are
-configured through the login environment, or through `/etc/ld.so.preload`.
+This puts every `nix-daemon` process on Metall, for all users and clients,
+without changing anything on the client side:
 
-**Daemon.** Add a systemd drop-in:
+* the main daemon
+* the worker process it forks for each client connection
+* the build-hook processes (`nix __build-remote`) it starts
+* the daemon's store work, such as substitution, `builtin:fetchurl`
+  downloads, NAR import and export, and garbage collection
+
+Evaluation in clients (`nix eval`, `nix build`, `nix-eval-jobs`) is not
+affected. It happens in the client process, before anything reaches the
+daemon. Builders are not affected either: they are not nix, so the library
+passes straight through in them.
+
+**systemd (any distribution, including Determinate Nix).** Add a drop-in:
 
 ```sh
 sudo systemctl edit nix-daemon.service
@@ -78,10 +89,19 @@ sudo systemctl edit nix-daemon.service
 Environment=LD_PRELOAD=/usr/local/lib/libmetall_preload.so
 # Optional: where the heaps go (default /tmp)
 # Environment=METALL_PRELOAD_DIR=/var/tmp
+# Optional: heap capacity per daemon process (default 256G, sparse)
+# Environment=METALL_PRELOAD_CAPACITY=256G
 ```
 
 ```sh
 sudo systemctl restart nix-daemon.service
+```
+
+**NixOS.**
+
+```nix
+systemd.services.nix-daemon.environment.LD_PRELOAD =
+  "/usr/local/lib/libmetall_preload.so";
 ```
 
 On Determinate Nix, `nix-daemon.service` runs `determinate-nixd`, which starts
@@ -92,10 +112,26 @@ environment is inherited. Check that it took effect:
 ```sh
 pid=$(pgrep -x nix-daemon | head -1)
 sudo grep -c libmetall_preload /proc/$pid/maps   # non-zero: loaded
-ls -d /tmp/metall-preload-$pid-*                  # present: active
+sudo ls -d /tmp/metall-preload-$pid-*            # present: active
 ```
 
-To undo it, run `sudo systemctl revert nix-daemon.service`, then restart.
+**What to expect.**
+
+* Each daemon process has its own heap directory. That means one for the
+  main daemon, plus a copy for each connection worker, made when it forks.
+* These heaps are removed when the process exits. A heap left by a killed
+  process is removed by the next nix process to start or exit.
+* Memory freed by evaluation is never collected, so a long-running
+  connection's heap only grows. Size the filesystem behind
+  `METALL_PRELOAD_DIR` to match.
+* Stopping the daemon removes the heap.
+
+To undo it, run `sudo systemctl revert nix-daemon.service`, then restart. On
+NixOS, remove the option and rebuild.
+
+### System-wide, for nix only
+
+Combine the daemon setup above with one of these for clients:
 
 **Clients, for every user's login shell.** Create `/etc/profile.d/metall-preload.sh`:
 
