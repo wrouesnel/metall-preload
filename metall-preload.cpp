@@ -154,16 +154,20 @@ pid_t g_owner_pid = 0;  // Only this process may delete g_dir.
 char g_root[512] = "/tmp";
 char g_dir[600] = "";
 
+// Only touched by the thread that holds the gate exclusively for a fork.
 struct PendingFork {
   ForkMode mode;
   int fd;
-  bool active;
   // The child reports whether it has its own heap on this pipe; the parent
   // waits for it, so nothing is written to the heap in the meantime.
   int status[2];
 };
-constexpr PendingFork kNoFork = {kForkNone, -1, false, {-1, -1}};
+constexpr PendingFork kNoFork = {kForkNone, -1, {-1, -1}};
 PendingFork g_fork = kNoFork;
+// Whether this thread took the gate for the fork it is in. Thread-local:
+// other threads fork concurrently (nix-eval-jobs starts workers from several
+// threads) and wait for the gate in their prepare handlers.
+__thread bool t_fork_locked __attribute__((tls_model("initial-exec"))) = false;
 // Set in the parent when the child could not get its own heap and has exited;
 // fork() and clone() then reap it and fail with ENOMEM.
 __thread bool t_fork_failed __attribute__((tls_model("initial-exec"))) = false;
@@ -738,11 +742,12 @@ bool copy_heap_private() {
 // CLONE_FILES), so it cannot be waited for through a pipe.
 void fork_prepare_impl(bool shared_files) {
   ++t_busy;
-  g_fork = kNoFork;
   t_fork_failed = false;
+  t_fork_locked = false;
   if (!g_active.load(std::memory_order_acquire)) return;
   gate_lock();
-  g_fork.active = true;
+  t_fork_locked = true;
+  g_fork = kNoFork;
   if (!g_need_snapshot) return;  // private heap: the kernel copies-on-write
 
   const std::size_t used =
@@ -805,7 +810,7 @@ void fork_prepare_impl(bool shared_files) {
 void fork_prepare() { fork_prepare_impl(false); }
 
 void fork_parent_impl(bool close_fd) {
-  if (g_fork.active) {
+  if (t_fork_locked) {
     if (g_fork.fd >= 0 && close_fd) close(g_fork.fd);
     if (g_fork.status[0] >= 0) {
       // EOF (the child died, or fork() failed) counts as failure.
@@ -819,9 +824,10 @@ void fork_parent_impl(bool close_fd) {
       if (r != 1 || c != 'y') t_fork_failed = true;
     }
     if (g_fork.mode == kForkFail) t_fork_failed = true;
+    g_fork = kNoFork;
+    t_fork_locked = false;
     gate_unlock();
   }
-  g_fork = kNoFork;
   --t_busy;
 }
 
@@ -830,7 +836,7 @@ void fork_parent() { fork_parent_impl(true); }
 // Runs in the child with only this thread alive; syscalls only. Exits the
 // child if it cannot get a heap of its own.
 void fork_child_impl(bool own_fds) {
-  if (g_fork.active && g_need_snapshot) {
+  if (t_fork_locked && g_need_snapshot) {
     char *seg = reinterpret_cast<char *>(g_seg_begin);
     ForkMode mode = g_fork.mode;
     bool ok = false;
@@ -881,12 +887,13 @@ void fork_child_impl(bool own_fds) {
       g_need_snapshot = false;
     }
   }
-  if (g_fork.active) {
+  if (t_fork_locked) {
     g_owner_pid = 0;  // the directory belongs to the parent
+    g_fork = kNoFork;
+    t_fork_locked = false;
     g_writer.store(0);
     for (auto &s : g_shards) s.n.store(0);
   }
-  g_fork = kNoFork;
   --t_busy;
 }
 
@@ -936,7 +943,8 @@ bool should_activate() {
   exe[n] = '\0';
   const char *base = strrchr(exe, '/');
   base = base ? base + 1 : exe;
-  return strcmp(base, "nix") == 0;
+  // nix-daemon, nix-build and friends are symlinks to nix.
+  return strcmp(base, "nix") == 0 || strcmp(base, "nix-eval-jobs") == 0;
 }
 
 // Finds the descriptors Metall opened under our directory: marks them

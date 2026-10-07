@@ -29,13 +29,101 @@ sudo env LD_PRELOAD=$L NIX_DAEMON_SOCKET_PATH=/tmp/test-daemon.sock nix daemon
 NIX_REMOTE=unix:///tmp/test-daemon.sock nix build ...
 ```
 
-To use it for the system daemon, add a drop-in to `nix-daemon.service` with
-`Environment=LD_PRELOAD=/path/to/libmetall_preload.so`. Make sure the library
-is readable by root and that it lives somewhere stable.
+The library only activates in processes whose `/proc/self/exe` is named `nix`
+or `nix-eval-jobs`. That covers `nix-daemon`, `nix-build`, `nix-instantiate`
+and the other entry points, which are symlinks to `nix`. Every other program
+that inherits `LD_PRELOAD` passes straight through to the normal allocator.
+That includes build hooks' children, `git`, `ssh` and builders. So it is safe
+to set `LD_PRELOAD` broadly. Programs that don't activate still load the
+library and go through its pass-through malloc, but that costs very little.
 
-The library only activates in processes whose `/proc/self/exe` is named `nix`.
-Every other program that inherits `LD_PRELOAD` (build hooks, `git`, `ssh`,
-builders and so on) passes straight through to the normal allocator.
+For anything longer-lived than a test, install the library somewhere stable
+that every user can read. The examples below use
+`/usr/local/lib/libmetall_preload.so`:
+
+```sh
+sudo install -m 0755 build/libmetall_preload.so /usr/local/lib/
+```
+
+Replacing the file in place affects every process that loads it from then on,
+so reinstall it the same way (`install` writes a new file, not over the old
+one).
+
+### For one shell session
+
+```sh
+export LD_PRELOAD=/usr/local/lib/libmetall_preload.so
+nix eval ...          # served from Metall
+nix-eval-jobs ...     # served from Metall, and so are its workers
+unset LD_PRELOAD      # back to normal
+```
+
+Only the nix client processes in this shell are affected. Anything they hand
+to the system daemon (builds, store writes) still runs in the daemon, without
+Metall, unless the daemon is set up as below.
+
+### System-wide, for nix only
+
+There are two parts. The daemon is configured through systemd. Clients are
+configured through the login environment, or through `/etc/ld.so.preload`.
+
+**Daemon.** Add a systemd drop-in:
+
+```sh
+sudo systemctl edit nix-daemon.service
+```
+
+```ini
+[Service]
+Environment=LD_PRELOAD=/usr/local/lib/libmetall_preload.so
+# Optional: where the heaps go (default /tmp)
+# Environment=METALL_PRELOAD_DIR=/var/tmp
+```
+
+```sh
+sudo systemctl restart nix-daemon.service
+```
+
+On Determinate Nix, `nix-daemon.service` runs `determinate-nixd`, which starts
+`nix-daemon` itself. The library passes through in `determinate-nixd`, whose
+name isn't `nix`, and activates in the `nix-daemon` it starts, provided the
+environment is inherited. Check that it took effect:
+
+```sh
+pid=$(pgrep -x nix-daemon | head -1)
+sudo grep -c libmetall_preload /proc/$pid/maps   # non-zero: loaded
+ls -d /tmp/metall-preload-$pid-*                  # present: active
+```
+
+To undo it, run `sudo systemctl revert nix-daemon.service`, then restart.
+
+**Clients, for every user's login shell.** Create `/etc/profile.d/metall-preload.sh`:
+
+```sh
+export LD_PRELOAD=/usr/local/lib/libmetall_preload.so
+```
+
+This reaches interactive and login shells, and anything started from them.
+It does not reach systemd services, cron jobs or other processes started
+outside a login shell.
+
+**Clients, for every process on the machine.** Add the library to
+`/etc/ld.so.preload`:
+
+```sh
+echo /usr/local/lib/libmetall_preload.so | sudo tee -a /etc/ld.so.preload
+```
+
+This loads the library into every dynamically linked process, including
+services and the daemon itself, so the systemd drop-in becomes unnecessary.
+It still only activates in nix. Be careful:
+
+* A missing or broken library at that path breaks every new process,
+  including `sudo`. Keep a root shell open while you change it.
+* To undo it, remove the line, or delete `/etc/ld.so.preload` if it held
+  nothing else.
+* Setting `METALL_PRELOAD_DISABLE=1` in a process's environment turns the
+  library off for that process without uninstalling anything.
 
 ### Environment
 
@@ -132,6 +220,15 @@ Every check passed on every version:
 A NixOS toplevel evaluation (nginx, postgresql and docker enabled) gave the
 same `drvPath` as without the preload on every version. It took 3.5–4.3 s
 under the preload, against 2.4–4.5 s natively.
+
+nix-eval-jobs 2.24.1, 2.32.1 and 2.34.3 (from nixpkgs) were run with 4
+workers and `--max-memory-size 512`, so workers restart often. Each run
+covered the first 2000 top-level nixpkgs 24.11 attributes. Every run produced
+the same 2665 jobs as without the preload, with identical drvPaths and
+outputs. Workers were forked from several threads at once, 24–58 forks per
+run. The only differences were the error traces of 2 attributes on 2.34. A
+second native run differs from the first in the same way: the traces depend
+on which jobs a worker happened to evaluate first.
 
 These are the `GC_*` entry points nix uses across these versions that the
 library does not interpose. All of them are thread or stack registration,

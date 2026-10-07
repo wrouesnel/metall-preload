@@ -142,6 +142,39 @@ int main() {
   stop = true;
   background.join();
 
+  PHASE("concurrent fork");
+  // Several threads forking at once, as nix-eval-jobs does when it starts
+  // workers. glibc runs the prepare handlers of concurrent forks in parallel.
+  stop = false;
+  std::thread churn([&] {
+    while (!stop) free(malloc(64));
+  });
+  std::vector<std::thread> forkers;
+  for (int t = 0; t < 8; ++t)
+    forkers.emplace_back([shared, t] {
+      for (int i = 0; i < 10; ++i) {
+        auto *mine = static_cast<int *>(malloc(sizeof(int)));
+        *mine = t;
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+          CHECK(*shared == 42 && *mine == t);
+          auto *s = new std::string(4096, 'x');
+          delete s;
+          *shared = -1;
+          _exit(0);
+        }
+        int status;
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(*shared == 42);
+        free(mine);
+      }
+    });
+  for (auto &t : forkers) t.join();
+  stop = true;
+  churn.join();
+
   PHASE("clone");
   // Raw clone() without CLONE_VM, the way nix starts sandboxed builds. The
   // stack deliberately lives in the (Metall) heap.
