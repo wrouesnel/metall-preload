@@ -49,10 +49,27 @@ Replacing the file in place affects every process that loads it from then on,
 so reinstall it the same way (`install` writes a new file, not over the old
 one).
 
+To check that Metall is active, ask for the version. When it is, the library
+adds `-METALL` to the version string:
+
+```sh
+$ LD_PRELOAD=/usr/local/lib/libmetall_preload.so nix --version
+nix (Nix-METALL) 2.18.9
+$ LD_PRELOAD=/usr/local/lib/libmetall_preload.so nix --version   # Determinate
+nix (Determinate Nix-METALL 3.22.5) 2.35.2
+```
+
+The tag only appears when the heap was actually set up. A plain
+`nix (Nix) ...` means the library was not loaded, or it was disabled or
+failed to start (run with `METALL_PRELOAD_VERBOSE=1` to see why). The tag
+works for every entry point (`nix-daemon --version`, `nix-build --version`
+and so on). nix-eval-jobs has no `--version` flag.
+
 ### For one shell session
 
 ```sh
 export LD_PRELOAD=/usr/local/lib/libmetall_preload.so
+nix --version         # nix (Nix-METALL) ...
 nix eval ...          # served from Metall
 nix-eval-jobs ...     # served from Metall, and so are its workers
 unset LD_PRELOAD      # back to normal
@@ -179,7 +196,9 @@ It still only activates in nix. Be careful:
   `operator new`/`delete` variant, and the Boehm `GC_*` API are replaced so
   that they allocate from one Metall manager. The manager lives in
   `/tmp/metall-preload-<pid>-XXXXXX/`. nix links mimalloc statically, which
-  is why the C++ operators are interposed as well.
+  is why the C++ operators are interposed as well. `fork` and `clone` are
+  wrapped for fork safety (see below). `fwrite` is wrapped only to tag the
+  `--version` line; every other call passes straight through.
 * **Boehm GC.** Boehm GC is initialised and then disabled. `GC_malloc*`
   returns zeroed Metall memory. `GC_gcollect` does nothing. Finalizers on
   Metall objects are never run.

@@ -215,6 +215,7 @@ struct Next {
   std::size_t (*malloc_usable_size)(void *);
   int (*clone)(int (*)(void *), void *, int, void *, ...);
   pid_t (*fork)(void);
+  std::size_t (*fwrite)(const void *, std::size_t, std::size_t, FILE *);
 };
 Next g_next = {};
 std::atomic<int> g_resolve_state{0};  // 0: not yet, 1: resolving, 2: done
@@ -263,6 +264,7 @@ void resolve_next() {
   resolve_one(n.malloc_usable_size, "malloc_usable_size");
   resolve_one(n.clone, "clone");
   resolve_one(n.fork, "fork");
+  resolve_one(n.fwrite, "fwrite");
   g_next = n;
   g_resolve_state.store(2);
 }
@@ -980,7 +982,14 @@ bool collect_metall_fds() {
   return g_num_sources * kBlockSize == g_mapped;
 }
 
-__attribute__((constructor(101))) void metall_preload_init() {
+// Set when this process was asked for --version and Metall is active; the
+// first version line written to stdout is then tagged with -METALL.
+std::atomic<bool> g_tag_version{false};
+
+// glibc passes argc/argv/envp to ELF constructors.
+__attribute__((constructor(101))) void metall_preload_init(int argc,
+                                                           char **argv,
+                                                           char **) {
   ++t_busy;  // everything allocated here comes from the next allocator
   resolve_next();
   g_verbose = env_flag("METALL_PRELOAD_VERBOSE");
@@ -1060,6 +1069,9 @@ __attribute__((constructor(101))) void metall_preload_init() {
        g_dir[0] ? g_dir : "(unlinked)", g_mapped >> 30,
        reinterpret_cast<void *>(g_seg_begin));
   g_active.store(true, std::memory_order_release);
+  for (int i = 1; argv && i < argc; ++i)
+    if (argv[i] && strcmp(argv[i], "--version") == 0)
+      g_tag_version.store(true, std::memory_order_relaxed);
   --t_busy;
 }
 
@@ -1258,6 +1270,36 @@ EXPORT int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) noex
   }
   errno = saved;
   return r;
+}
+
+// fwrite(): nix prints its version line with std::cout, which libstdc++
+// writes with fwrite. "nix (Nix) 2.18.9" becomes "nix (Nix-METALL) 2.18.9"
+// and "nix (Determinate Nix 3.22.5) 2.35.2" becomes
+// "nix (Determinate Nix-METALL 3.22.5) 2.35.2".
+static std::size_t tag_version(const char *s, std::size_t len, FILE *f) {
+  const char *open = static_cast<const char *>(memchr(s, '(', len));
+  const char *close = open ? static_cast<const char *>(
+                                 memchr(open, ')', len - (open - s)))
+                           : nullptr;
+  for (const char *p = open; close && p + 3 <= close; ++p) {
+    if (memcmp(p, "Nix", 3) != 0 || (p[3] != ' ' && p[3] != ')')) continue;
+    g_tag_version.store(false, std::memory_order_relaxed);
+    const std::size_t head = std::size_t(p + 3 - s);
+    if (g_next.fwrite(s, 1, head, f) != head ||
+        g_next.fwrite("-METALL", 1, 7, f) != 7)
+      return 0;
+    return head + g_next.fwrite(s + head, 1, len - head, f);
+  }
+  return g_next.fwrite(s, 1, len, f);
+}
+
+EXPORT std::size_t fwrite(const void *ptr, std::size_t size, std::size_t n,
+                          FILE *f) {
+  if (!next_ready() || !g_next.fwrite) return 0;
+  if (__builtin_expect(g_tag_version.load(std::memory_order_relaxed), 0) &&
+      f == stdout && size == 1)
+    return tag_version(static_cast<const char *>(ptr), n, f);
+  return g_next.fwrite(ptr, size, n, f);
 }
 
 // fork() runs the pthread_atfork handlers; this only turns a child that
