@@ -894,6 +894,13 @@ __attribute__((destructor(101))) void metall_preload_fini() {
     g_dir[0] = '\0';
     --t_busy;
   }
+  // Also sweep up after build hooks: nix SIGKILLs them once a build is
+  // assigned, so they never get here themselves.
+  if (g_active.load(std::memory_order_acquire)) {
+    ++t_busy;
+    reap_stale_dirs();
+    --t_busy;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1118,23 @@ EXPORT void *GC_malloc_atomic_uncollectable(std::size_t n) {
   if (p) return p;
   REAL_GC("GC_malloc_atomic_uncollectable", void *(*)(std::size_t));
   return real ? real(n) : nullptr;
+}
+
+// nix <= 2.24 copies every evaluator string with GC_STRDUP.
+EXPORT char *GC_strndup(const char *s, std::size_t n) {
+  n = strnlen(s, n);
+  if (auto *p = static_cast<char *>(m_alloc(n + 1, 0))) {
+    std::memcpy(p, s, n);
+    p[n] = 0;
+    return p;
+  }
+  REAL_GC("GC_strndup", char *(*)(const char *, std::size_t));
+  return real ? real(s, n) : nullptr;
+}
+
+EXPORT char *GC_strdup(const char *s) {
+  if (!s) return nullptr;
+  return GC_strndup(s, SIZE_MAX);
 }
 
 // Returns a list of zeroed objects linked through their first word.

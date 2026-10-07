@@ -72,8 +72,9 @@ builders and so on) passes straight through to the normal allocator.
     instead.
 * **Cleanup.**
   * The heap directory is removed when the owning process exits.
-  * A process that is SIGKILLed leaves its directory behind. The next process
-    to start removes it if the owning PID is dead, or if the directory is
+  * A process that is SIGKILLed leaves its directory behind. nix does this to
+    every build hook. Any preloaded process removes such directories when it
+    starts or exits, if the owning PID is dead or if the directory is
     unlocked and older than 60s.
 * **Fallback.**
   * These requests go to the normal allocator:
@@ -92,7 +93,58 @@ builders and so on) passes straight through to the normal allocator.
   heap file, not by swap. On a tmpfs `/tmp` they still count as RAM or swap.
   Use a disk-backed `METALL_PRELOAD_DIR` to take the load off RAM.
 * **Speed.** Small allocations are about 5x slower than mimalloc. Each fork
-  costs a snapshot, measured at 0–4 ms here.
+  costs a snapshot, measured at 0–4 ms here. Parallel evaluation
+  (`eval-cores`) works but scales poorly. A `nix search` with 8 cores took
+  2.4 s wall and 10.3 s CPU under the preload, against 1.2 s and 2.6 s
+  natively.
+* **Dynamic builds only.** `LD_PRELOAD` has no effect on statically linked
+  nix (for example `nix-cli-static`).
+
+## Compatibility
+
+`test/versions.sh` was run against these builds:
+
+* upstream nix 2.18.9, 2.19.7, 2.20.9, 2.21.5, 2.22.4, 2.23.4, 2.24.15,
+  2.25.5, 2.26.4, 2.28.7, 2.29.4, 2.30.5, 2.31.5, 2.32.8, 2.33.6, 2.34.8 and
+  2.35.2, all from nixpkgs (there is no 2.27 in nixpkgs)
+* Determinate Nix 3.0.0, 3.4.2, 3.8.6, 3.12.2, 3.16.3, 3.20.0, 3.22.5 and
+  3.23.1
+
+Every check passed on every version:
+
+* The library activates.
+* A pure evaluation stress test (strings, attrsets, JSON, regexes, sorting,
+  recursion) gives the same result as without the preload.
+* nixpkgs `firefox.drvPath` gives the same result. `nix-instantiate` of
+  `hello` through the system daemon gives the same result. A `path:` flake
+  eval gives the same result. So does a `nix search` with `eval-cores = 8`.
+* A preloaded root `nix-daemon` serves a throwaway chroot store, and a
+  preloaded client runs 4 concurrent sandboxed builds through it. Every
+  build sees `$$ = 1`. No heap directories remain after the daemon exits.
+
+A NixOS toplevel evaluation (nginx, postgresql and docker enabled) gave the
+same `drvPath` as without the preload on every version. It took 3.5–4.3 s
+under the preload, against 2.4–4.5 s natively.
+
+These are the `GC_*` entry points nix uses across these versions that the
+library does not interpose. All of them are thread or stack registration,
+statistics, or configuration, and are safe to pass to the real libgc with
+collection disabled:
+
+* `GC_add_roots`, `GC_remove_roots`, `GC_allow_register_threads`,
+  `GC_register_my_thread`, `GC_unregister_my_thread`, `GC_register_stack`,
+  `GC_unregister_stack`, `GC_get_stack_base`, `GC_set_sp_corrector`
+* `GC_get_heap_usage_safe`, `GC_get_bytes_since_gc`, `GC_get_gc_no`,
+  `GC_get_full_gc_total_time`, `GC_start_performance_measurement`
+* `GC_set_oom_fn`, `GC_set_warn_proc`, `GC_set_all_interior_pointers`,
+  `GC_set_no_dls`, `GC_register_displacement`
+* `GC_enable`/`GC_disable`. nix 2.18–2.23 calls these in balanced pairs, so
+  the library's extra `GC_disable` keeps collection off.
+* `GC_base`. This returns NULL for Metall pointers, so `gc_cleanup` skips
+  registering a finalizer.
+
+nix up to 2.24 copies every evaluator string with `GC_strdup`, which the
+library interposes.
 
 ## Measurements
 
@@ -109,4 +161,19 @@ These were measured with Determinate nix 3.22.5.
 ```sh
 g++ -O1 -g -std=c++20 -pthread test/stress.cpp -o build/stress
 METALL_PRELOAD_ALL_PROCESSES=1 LD_PRELOAD=$PWD/build/libmetall_preload.so build/stress
+
+# version matrix; needs sudo for the daemon check (SKIP_DAEMON=1 to skip)
+nix build --no-link --print-out-paths github:NixOS/nixpkgs/nixos-24.11#nixVersions.nix_2_18
+test/versions.sh 2.18=/nix/store/...-nix-2.18.9 3.23.1=/nix/store/...-determinate-nix-3.23.1
 ```
+
+The version matrix evaluates a nixpkgs source tree that every version can
+read (`NIXPKGS`, default nixos-24.11). Upstream builds come from the nixpkgs
+release branches:
+
+* nixos-24.11: 2.18–2.23, 2.25 and 2.26
+* nixos-25.05: 2.24
+* nixos-25.11: 2.28–2.30, 2.32 and 2.33
+* nixos-26.05: 2.31, 2.34 and 2.35 Determinate builds are
+`github:DeterminateSystems/nix-src/v<version>#nix-cli`. Only the latest
+release is in its binary cache, so older ones are built from source.

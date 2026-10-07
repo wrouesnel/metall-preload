@@ -6,6 +6,7 @@
     clone;
     GC_init; GC_malloc; GC_malloc_atomic; GC_malloc_uncollectable;
     GC_malloc_atomic_uncollectable; GC_malloc_many; GC_free;
+    GC_strdup; GC_strndup;
     GC_gcollect; GC_expand_hp;
     GC_register_finalizer; GC_register_finalizer_ignore_self;
     GC_register_finalizer_no_order; GC_register_finalizer_unreachable;
