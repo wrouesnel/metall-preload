@@ -16,6 +16,45 @@ cmake --build build
 # -> build/libmetall_preload.so
 ```
 
+The C++ runtime is linked statically (`METALL_PRELOAD_STATIC_RUNTIME`, on by
+default), so the library depends only on glibc. Inside nix, the dynamic
+linker would otherwise bind it to nix's own `libstdc++`. A library built with
+a newer GCC could then need C++ library symbols that an older nix doesn't
+have, and nix would fail to start.
+
+## Installing on a system
+
+Each [GitHub release](https://github.com/wrouesnel/metall-preload/releases)
+has a deployment bundle for each of RHEL 8, RHEL 10, Ubuntu 24.04 and Ubuntu
+26.04. Each bundle has the library and an installer that sets up the system
+`nix-daemon` and every user's sessions:
+
+```sh
+tar xzf metall-preload-<version>-<platform>-x86_64.tar.gz
+sudo metall-preload-<version>-<platform>-x86_64/install.sh
+nix --version   # in a new session: nix (... Nix-METALL ...) ...
+```
+
+[deploy/README.md](deploy/README.md) covers the options, updating,
+uninstalling, and which bundle to pick for other distributions. The installer
+also works from a source checkout, using `build/libmetall_preload.so`:
+`sudo deploy/install.sh`.
+
+On NixOS, import [deploy/nixos/module.nix](deploy/nixos/module.nix). It
+builds the library with nixpkgs and sets it up for `nix-daemon` and all
+sessions:
+
+```nix
+{
+  imports = [ ./metall-preload/deploy/nixos/module.nix ];
+  services.metall-preload.enable = true;
+  # services.metall-preload.heapDir = "/var/tmp";   # default /tmp
+}
+```
+
+The rest of this section and the next explain what the installer does, and
+how to set things up by hand.
+
 ## Usage
 
 ```sh
@@ -114,7 +153,7 @@ Environment=LD_PRELOAD=/usr/local/lib/libmetall_preload.so
 sudo systemctl restart nix-daemon.service
 ```
 
-**NixOS.**
+**NixOS.** Use the module (see [Installing on a system](#installing-on-a-system)), or set it directly:
 
 ```nix
 systemd.services.nix-daemon.environment.LD_PRELOAD =
@@ -148,7 +187,20 @@ NixOS, remove the option and rebuild.
 
 ### System-wide, for nix only
 
-Combine the daemon setup above with one of these for clients:
+Combine the daemon setup above with one of these for clients. `install.sh`
+uses the first by default (`--shells pam`), or the second with
+`--shells profile`.
+
+**Clients, for every user session.** Add the library to `/etc/environment`:
+
+```sh
+echo LD_PRELOAD=/usr/local/lib/libmetall_preload.so | sudo tee -a /etc/environment
+```
+
+PAM's `pam_env` applies this to every new session: ssh (including
+non-interactive `ssh host nix ...`), console and `su` logins, and cron,
+whatever the shell. It does not reach systemd services. `sudo` resets the
+environment, so `sudo nix ...` runs without it.
 
 **Clients, for every user's login shell.** Create `/etc/profile.d/metall-preload.sh`:
 
@@ -314,6 +366,37 @@ These were measured with Determinate nix 3.22.5.
 | `nix eval nixpkgs#firefox.drvPath` | 3.0 s | 4.5 s (identical result) |
 | outPath of every attribute of nixpkgs, `eval-cores = 4` | 247 s, 21.3 GB RSS | 193 s, 14.5 GB RSS (identical result) |
 | `test/stress.cpp` | 7.6 s | ~48 s |
+
+## Releases
+
+[.github/workflows/release.yml](.github/workflows/release.yml) builds a
+bundle for each platform with
+[packaging/build-release.sh](packaging/build-release.sh). It runs in AlmaLinux
+8 and 10 (binary-compatible with RHEL 8 and 10), Ubuntu 24.04 and Ubuntu 26.04
+containers, on every push to `main` and on every pull request. Each build
+checks that the library needs only glibc and exports only the interposed
+symbols, and runs the stress test under it.
+
+Pushing a tag publishes a release with the four bundles and `SHA256SUMS`:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+To build all four bundles locally in the same containers, use podman (or
+`CONTAINER=docker`):
+
+```sh
+packaging/build-all.sh [version]   # -> dist/
+```
+
+| Bundle | Built with | Needs |
+|---|---|---|
+| `rhel8` | GCC 13 (gcc-toolset-13), Boost 1.86 headers | glibc 2.27 |
+| `rhel10` | GCC 14 | glibc 2.38 |
+| `ubuntu2404` | GCC 13 | glibc 2.38 |
+| `ubuntu2604` | GCC 15 | glibc 2.38 |
 
 ## Tests
 

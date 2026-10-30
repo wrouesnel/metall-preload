@@ -1,0 +1,68 @@
+# Builds a deployment bundle for each supported platform. Pushing a v* tag
+# also publishes them as a GitHub release.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AlmaLinux is binary-compatible with the RHEL release of the same number.
+          - { platform: rhel8, image: "almalinux:8" }
+          - { platform: rhel10, image: "almalinux:10" }
+          - { platform: ubuntu2404, image: "ubuntu:24.04" }
+          - { platform: ubuntu2604, image: "ubuntu:26.04" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the bundle
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=0.0.0-${GITHUB_SHA::12}
+          fi
+          packaging/build-release.sh "${{ matrix.platform }}" "$version" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bundle-*
+          merge-multiple: true
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          cat ./*.sha256 >SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --generate-notes --verify-tag

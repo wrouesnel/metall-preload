@@ -85,7 +85,9 @@ int main() {
   CHECK(malloc_usable_size(p) >= 8000);
   free(p);
   volatile size_t huge = SIZE_MAX / 2;
-  CHECK(calloc(huge, 4) == nullptr);
+  // volatile, or GCC 15 elides the unused allocation and folds the check.
+  void *volatile overflow = calloc(huge, 4);
+  CHECK(overflow == nullptr);
   for (size_t a : {16, 32, 64, 256, 4096, 8192, 65536}) {
     void *q = nullptr;
     CHECK(posix_memalign(&q, a, 100) == 0);
