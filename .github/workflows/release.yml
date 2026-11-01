@@ -17,6 +17,10 @@ jobs:
     name: build (${{ matrix.platform }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
+    defaults:
+      run:
+        # Containers default to sh, which is dash on Ubuntu.
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
