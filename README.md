@@ -212,23 +212,19 @@ This reaches interactive and login shells, and anything started from them.
 It does not reach systemd services, cron jobs or other processes started
 outside a login shell.
 
-**Clients, for every process on the machine.** Add the library to
-`/etc/ld.so.preload`:
+**Not `/etc/ld.so.preload`.** It looks like the way to reach every process,
+but it doesn't work for nix. nix runs on the nix store's own glibc, and that
+glibc's dynamic linker never reads the host's `/etc/ld.so.preload`. Tested
+with Determinate Nix 3.24.1 on Ubuntu 24.04:
 
-```sh
-echo /usr/local/lib/libmetall_preload.so | sudo tee -a /etc/ld.so.preload
-```
+* host programs loaded the library;
+* `nix` and the restarted `nix-daemon` did not.
 
-This loads the library into every dynamically linked process, including
-services and the daemon itself, so the systemd drop-in becomes unnecessary.
-It still only activates in nix. Be careful:
+Use `LD_PRELOAD`: through the daemon drop-in, the session environment, or
+the environment of whatever starts nix.
 
-* A missing or broken library at that path breaks every new process,
-  including `sudo`. Keep a root shell open while you change it.
-* To undo it, remove the line, or delete `/etc/ld.so.preload` if it held
-  nothing else.
-* Setting `METALL_PRELOAD_DISABLE=1` in a process's environment turns the
-  library off for that process without uninstalling anything.
+`METALL_PRELOAD_DISABLE=1` in a process's environment turns the library off
+for that process without uninstalling anything.
 
 ### Environment
 
