@@ -13,11 +13,36 @@ BUILDINFO                     platform, compiler and minimum glibc
 
 ## Pick a bundle
 
-Use the bundle built for your distribution. Any bundle works on a system
-whose glibc is at least the one in its `BUILDINFO`. The `rhel8` bundle needs
-only glibc 2.27, so it is the fallback for anything else. The library carries
-its own C++ runtime, so it works with every nix version from 2.18 on,
-including Determinate Nix.
+The library is loaded in two places, and each uses a different glibc:
+
+* **In nix:** against the glibc nix was built with. nix carries its own
+  glibc in the nix store, and it can be older than the system's.
+* **In everything else that inherits `LD_PRELOAD`:** against the system's
+  glibc.
+
+Both must be at least the glibc in the bundle's `BUILDINFO`.
+
+| Bundle | Needs glibc | Use it for |
+|---|---|---|
+| `rhel8` | 2.27 | Any system and any nix. **The safe choice.** |
+| `rhel10`, `ubuntu2404`, `ubuntu2604` | 2.38 | Only when your nix was built with glibc 2.38 or newer |
+
+Some nix builds use an older glibc. Upstream nix 2.18 and earlier, as built
+from nixpkgs 23.05 (and the official installer of that time), uses glibc
+2.37. With a 2.38 bundle, its `nix-daemon` exits at once with "version
+`GLIBC_2.38' not found". Recent Determinate Nix uses glibc 2.40 or newer.
+
+To see which glibc your nix uses:
+
+```sh
+ldd "$(readlink -f "$(command -v nix)")" | grep libc.so
+# libc.so.6 => /nix/store/...-glibc-2.37-45/lib/libc.so.6
+```
+
+`install.sh` checks both: it loads the library into `/bin/true` and into
+`nix --version` (`--nix FILE` picks which nix to check), and refuses to
+install if either fails. The library carries its own C++ runtime, so glibc
+is all that matters.
 
 ## Install
 
@@ -29,7 +54,8 @@ sudo ./install.sh
 
 This:
 
-1. Checks that this system can load the library, and stops if it can't.
+1. Checks that both this system and its nix can load the library (see
+   above), and stops if either can't.
 2. Installs it as `/usr/local/lib/libmetall_preload.so`.
 3. Adds `/etc/systemd/system/nix-daemon.service.d/metall-preload.conf`,
    restarts `nix-daemon.service`, and checks that the running daemon has the
@@ -63,6 +89,7 @@ Options:
 | `--no-restart` | | Don't restart the daemon now |
 | `--prefix DIR` | `/usr/local/lib` | Where to install the library |
 | `--lib FILE` | `lib/libmetall_preload.so` | Install a different build |
+| `--nix FILE` | `/nix/var/nix/profiles/default/bin/nix` | The nix to check the library against |
 
 The library only activates in `nix` (and its `nix-daemon`, `nix-build` and
 similar entry points) and `nix-eval-jobs`. Every other program that inherits

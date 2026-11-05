@@ -35,8 +35,12 @@ sudo metall-preload-<version>-<platform>-x86_64/install.sh
 nix --version   # in a new session: nix (... Nix-METALL ...) ...
 ```
 
-[deploy/README.md](deploy/README.md) covers the options, updating,
-uninstalling, and which bundle to pick for other distributions. The installer
+Choose the bundle by the glibc **your nix** was built with, not the host's:
+nix brings its own glibc, and that's the one the library loads against
+inside nix. The `rhel8` bundle needs only glibc 2.27 and works with every
+nix. The other three need 2.38, which rules out, for example, upstream nix
+2.18 built from nixpkgs 23.05 (glibc 2.37). [deploy/README.md](deploy/README.md)
+explains how to check, and covers the options, updating and uninstalling. The installer
 also works from a source checkout, using `build/libmetall_preload.so`:
 `sudo deploy/install.sh`.
 
@@ -393,6 +397,11 @@ packaging/build-all.sh [version]   # -> dist/
 | `rhel10` | GCC 14 | glibc 2.38 |
 | `ubuntu2404` | GCC 13 | glibc 2.38 |
 | `ubuntu2604` | GCC 15 | glibc 2.38 |
+
+"Needs" applies both to the system and to the glibc nix was built with.
+The compatibility tests above used nix builds from nixpkgs 24.11 and later,
+whose glibc is 2.40 or newer. Older nix builds can have an older glibc (2.37
+in nixpkgs 23.05) and then need the `rhel8` bundle.
 
 ## Tests
 

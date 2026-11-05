@@ -15,6 +15,8 @@
 #                                console, su, cron) and any shell
 #                       profile  /etc/profile.d: login shells that read it
 #                       none     leave user sessions alone
+#   --nix FILE        nix binary to check the library against (default:
+#                     /nix/var/nix/profiles/default/bin/nix)
 #   --no-daemon       leave nix-daemon.service alone
 #   --no-restart      don't restart nix-daemon.service (running builds are
 #                     not interrupted; the change applies at the next start)
@@ -33,13 +35,16 @@ for candidate in "$here/lib/libmetall_preload.so" "$here/../build/libmetall_prel
   if [ -z "$lib_src" ] && [ -f "$candidate" ]; then lib_src=$candidate; fi
 done
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+nix=/nix/var/nix/profiles/default/bin/nix
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
   case $1 in
     --lib) lib_src=$2; shift ;;
     --prefix) prefix=$2; shift ;;
     --heap-dir) heap_dir=$2; shift ;;
     --shells) shells=$2; shift ;;
+    --nix) nix=$2; shift ;;
     --no-daemon) daemon=0 ;;
     --no-restart) restart=0 ;;
     --uninstall) action=uninstall ;;
@@ -59,7 +64,6 @@ dropin=/etc/systemd/system/nix-daemon.service.d/metall-preload.conf
 profile=/etc/profile.d/metall-preload.sh
 environment=/etc/environment
 marker="# metall-preload: added by install.sh, removed by install.sh --uninstall"
-nix=/nix/var/nix/profiles/default/bin/nix
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -131,6 +135,22 @@ if ! err=$(LD_PRELOAD=$lib_src /bin/true 2>&1) || [ -n "$err" ]; then
   echo "this system cannot load $lib_src:" >&2
   echo "$err" >&2
   exit 1
+fi
+
+# nix runs on the nix store's own glibc, which can be older than the
+# system's, so the library must load and activate in nix itself too. The
+# daemon would otherwise exit at once and trip systemd's start limit.
+if [ -x "$nix" ]; then
+  if ! out=$(LD_PRELOAD=$lib_src "$nix" --version 2>&1) ||
+    ! printf '%s\n' "$out" | grep -q -- '-METALL'; then
+    echo "$nix cannot use $lib_src:" >&2
+    printf '%s\n' "$out" | grep -v "unknown setting" >&2
+    echo "Use a bundle whose BUILDINFO glibc is no newer than the one this nix" >&2
+    echo "was built with. The rhel8 bundle needs only glibc 2.27." >&2
+    exit 1
+  fi
+else
+  warn "no nix at $nix to check the library against (see --nix)"
 fi
 
 say "installing $lib"
